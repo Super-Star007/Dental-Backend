@@ -8,6 +8,9 @@ dotenv.config();
 
 const app = express();
 
+// Trust reverse proxy (for correct client IP via X-Forwarded-For)
+app.set('trust proxy', true);
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -15,11 +18,33 @@ app.use(express.urlencoded({ extended: true }));
 
 // Serve static files from uploads directory
 const path = require('path');
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+const uploadsPath = path.join(__dirname, 'uploads');
+console.log('📁 Serving static files from:', uploadsPath);
+
+// Serve static files with proper MIME types
+app.use('/uploads', express.static(uploadsPath, {
+  setHeaders: (res, filePath, stat) => {
+    // Set proper Content-Type headers for images
+    const ext = path.extname(filePath).toLowerCase();
+    const mimeTypes = {
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif',
+      '.webp': 'image/webp'
+    };
+    
+    if (mimeTypes[ext]) {
+      res.setHeader('Content-Type', mimeTypes[ext]);
+      res.setHeader('Cache-Control', 'public, max-age=31536000');
+    }
+  }
+}));
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
+app.use('/api/audit-logs', require('./routes/auditLogs'));
 app.use('/api/visits', require('./routes/visits'));
 app.use('/api/patients', require('./routes/patients'));
 app.use('/api/facilities', require('./routes/facilities'));
@@ -28,17 +53,6 @@ app.use('/api/facilities', require('./routes/facilities'));
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'Nigrek Dental Visit System API' });
 });
-
-// Handle 404 for API routes
-app.use('/api/*', (req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'API endpoint not found',
-  });
-});
-
-// Note: Non-API routes should be handled by React Router (development) or static file server (production)
-// The backend should not handle frontend routes
 
 // Connect to MongoDB
 const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/nigrek-dental';

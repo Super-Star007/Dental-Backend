@@ -1,8 +1,25 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const userSchema = new mongoose.Schema(
   {
+    // Immutable internal ID for tracking (does not change even if login/email changes)
+    internalId: {
+      type: String,
+      unique: true,
+      default: () => crypto.randomUUID(),
+      immutable: true,
+      index: true,
+    },
+    // Login ID (separate from contact email). Can be changed; internalId remains stable.
+    loginId: {
+      type: String,
+      unique: true,
+      sparse: true,
+      trim: true,
+      index: true,
+    },
     name: {
       type: String,
       required: [true, '名前を入力してください'],
@@ -54,14 +71,34 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ['admin', 'dentist', 'hygienist', 'staff', 'billing'],
+      // Keep existing roles for backwards compatibility; add new roles for the new policy.
+      enum: ['system_admin', 'clinic_admin', 'admin', 'dentist', 'hygienist', 'staff', 'billing'],
       default: 'staff',
     },
     resetPasswordToken: String,
     resetPasswordExpire: Date,
+    lastLoginAt: {
+      type: Date,
+      default: null,
+    },
+    lastLoginIp: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    mustChangePassword: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
     isActive: {
       type: Boolean,
       default: true,
+    },
+    deletedAt: {
+      type: Date,
+      default: null,
+      index: true,
     },
     avatar: {
       type: String,
@@ -83,6 +120,11 @@ const userSchema = new mongoose.Schema(
 
 // Hash password before saving (only if password exists and is modified)
 userSchema.pre('save', async function (next) {
+  // Default loginId to email when missing (helps migration / existing flows)
+  if (!this.loginId && this.email) {
+    this.loginId = this.email;
+  }
+
   if (!this.isModified('password') || !this.password) {
     return next();
   }
@@ -109,7 +151,11 @@ userSchema.methods.getResetPasswordToken = function () {
     .update(resetToken)
     .digest('hex');
 
-  this.resetPasswordExpire = Date.now() + 10 * 60 * 1000; // 10 minutes
+  // Token expires in 30 minutes (development) or 10 minutes (production)
+  const expirationTime = process.env.NODE_ENV === 'production' 
+    ? 10 * 60 * 1000  // 10 minutes for production
+    : 30 * 60 * 1000; // 30 minutes for development
+  this.resetPasswordExpire = Date.now() + expirationTime;
 
   return resetToken;
 };

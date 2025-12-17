@@ -2,21 +2,27 @@ const express = require('express');
 const { body, validationResult } = require('express-validator');
 const passport = require('passport');
 const User = require('../models/User');
+const AuditLog = require('../models/AuditLog');
 const generateToken = require('../utils/generateToken');
 const sendEmail = require('../utils/sendEmail');
 const crypto = require('crypto');
-const { protect } = require('../middleware/auth');
+const { protect, authorize } = require('../middleware/auth');
 
 // Initialize passport
 require('../config/passport');
 
 const router = express.Router();
 
+// Self-registration is not allowed (policy)
+// Keeping endpoint path for compatibility, but it now requires system_admin/admin (see above).
+
 // @route   POST /api/auth/register
-// @desc    Register a new user
-// @access  Public
+// @desc    Provision a clinic account (no self-registration)
+// @access  Private (system_admin/admin only)
 router.post(
   '/register',
+  protect,
+  authorize('system_admin', 'admin'),
   [
     body('name').trim().notEmpty().withMessage('名前を入力してください'),
     body('email')
@@ -26,6 +32,11 @@ router.post(
     body('password')
       .isLength({ min: 6 })
       .withMessage('パスワードは6文字以上で入力してください'),
+    body('loginId')
+      .optional({ checkFalsy: true })
+      .trim()
+      .isLength({ min: 3 })
+      .withMessage('ログインIDは3文字以上で入力してください'),
   ],
   async (req, res) => {
     try {
@@ -33,11 +44,12 @@ router.post(
       if (!errors.isEmpty()) {
         return res.status(400).json({
           success: false,
+          message: '入力内容を確認してください。',
           errors: errors.array(),
         });
       }
 
-      const { name, email, password, role } = req.body;
+      const { name, email, password, loginId } = req.body;
 
       // Check if user already exists
       const userExists = await User.findOne({ email });
@@ -49,29 +61,62 @@ router.post(
         });
       }
 
-      // Create user
+      // Prevent loginId collision
+      if (loginId) {
+        const loginIdExists = await User.findOne({ loginId });
+        if (loginIdExists) {
+          return res.status(400).json({
+            success: false,
+            message: 'このログインIDは既に使用されています。',
+          });
+        }
+      }
+
+      // Create clinic admin account (role fixed by policy)
       const user = await User.create({
         name,
         email,
         password,
-        role: role || 'staff',
+        loginId: loginId || email,
+        role: 'clinic_admin',
+        mustChangePassword: true,
       });
 
-      // Generate token
-      const token = generateToken(user._id);
+      // Audit
+      try {
+        await AuditLog.create({
+          actorRole: req.user.role,
+          actorId: req.user._id,
+          action: 'clinic_account_created',
+          targetUserId: user._id,
+          targetInternalId: user.internalId,
+          meta: {
+            email: user.email,
+            loginId: user.loginId,
+            role: user.role,
+          },
+        });
+      } catch (e) {
+        // Do not fail provisioning on audit failure
+        console.error('AuditLog create failed:', e.message);
+      }
 
       res.status(201).json({
         success: true,
-        message: 'ユーザー登録が完了しました。',
-        token,
+        message: '医院アカウントを発行しました。',
         user: {
           id: user._id,
+          internalId: user.internalId,
           name: user.name,
           email: user.email,
+          loginId: user.loginId,
           role: user.role,
           phone: user.phone,
           address: user.address,
           avatar: user.avatar,
+          isActive: user.isActive,
+          deletedAt: user.deletedAt,
+          mustChangePassword: user.mustChangePassword,
         },
       });
     } catch (error) {
@@ -98,9 +143,21 @@ router.post(
   '/login',
   [
     body('email')
+      .optional({ checkFalsy: true })
       .isEmail()
       .normalizeEmail()
       .withMessage('有効なメールアドレスを入力してください'),
+    body('loginId')
+      .optional({ checkFalsy: true })
+      .trim()
+      .notEmpty()
+      .withMessage('ログインIDを入力してください'),
+    body().custom((_, { req }) => {
+      if (!req.body.email && !req.body.loginId) {
+        throw new Error('ログインIDまたはメールアドレスを入力してください');
+      }
+      return true;
+    }),
     body('password').notEmpty().withMessage('パスワードを入力してください'),
   ],
   async (req, res) => {
@@ -113,43 +170,28 @@ router.post(
         });
       }
 
-      const { email, password } = req.body;
+      const { email, loginId, password } = req.body;
 
       // Check if user exists and get password
-      const user = await User.findOne({ email }).select('+password');
+      const user = await User.findOne({
+        $or: [
+          ...(email ? [{ email }] : []),
+          ...(loginId ? [{ loginId }] : []),
+        ],
+      }).select('+password');
 
       if (!user) {
         return res.status(401).json({
           success: false,
           message: 'メールアドレスまたはパスワードが正しくありません。',
-          errorType: 'INVALID_CREDENTIALS',
         });
       }
 
       // Check if user is active
-      if (!user.isActive) {
+      if (!user.isActive || user.deletedAt) {
         return res.status(401).json({
           success: false,
           message: 'このアカウントは無効です。管理者にお問い合わせください。',
-          errorType: 'ACCOUNT_INACTIVE',
-        });
-      }
-
-      // Check if user is OAuth-only (no password set)
-      if ((user.googleId || user.facebookId) && !user.password) {
-        return res.status(401).json({
-          success: false,
-          message: 'このアカウントはGoogleまたはFacebookで登録されています。OAuthログインを使用してください。',
-          errorType: 'OAUTH_ONLY_ACCOUNT',
-        });
-      }
-
-      // Check if user has password
-      if (!user.password) {
-        return res.status(401).json({
-          success: false,
-          message: 'パスワードが設定されていません。パスワードリセット機能を使用してください。',
-          errorType: 'NO_PASSWORD',
         });
       }
 
@@ -160,12 +202,46 @@ router.post(
         return res.status(401).json({
           success: false,
           message: 'メールアドレスまたはパスワードが正しくありません。',
-          errorType: 'INVALID_PASSWORD',
         });
       }
 
       // Generate token
       const token = generateToken(user._id);
+
+      // Update last login timestamp (best-effort) + audit
+      try {
+        const ip =
+          (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim() ||
+          req.ip ||
+          req.socket?.remoteAddress ||
+          null;
+        const userAgent = req.headers['user-agent'] || null;
+
+        user.lastLoginAt = new Date();
+        user.lastLoginIp = ip;
+        await user.save({ validateBeforeSave: false });
+      } catch (e) {
+        // ignore
+      }
+      try {
+        const ip =
+          (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim() ||
+          req.ip ||
+          req.socket?.remoteAddress ||
+          null;
+        const userAgent = req.headers['user-agent'] || null;
+
+        await AuditLog.create({
+          actorRole: user.role,
+          actorId: user._id,
+          action: 'login_success',
+          targetUserId: user._id,
+          targetInternalId: user.internalId,
+          meta: { loginId: user.loginId, email: user.email, ip, userAgent },
+        });
+      } catch (e) {
+        // ignore
+      }
 
       res.json({
         success: true,
@@ -173,12 +249,15 @@ router.post(
         token,
         user: {
           id: user._id,
+          internalId: user.internalId,
           name: user.name,
           email: user.email,
+          loginId: user.loginId,
           role: user.role,
           phone: user.phone,
           address: user.address,
           avatar: user.avatar,
+          mustChangePassword: user.mustChangePassword,
         },
       });
     } catch (error) {
@@ -228,8 +307,9 @@ router.post(
       const resetToken = user.getResetPasswordToken();
       await user.save({ validateBeforeSave: false });
 
-      // Create reset url
-      const resetUrl = `${process.env.FRONTEND_URL}/reset-password/${resetToken}`;
+      // Create reset url with fallback
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+      const resetUrl = `${frontendUrl}/reset-password/${resetToken}`;
 
       const message = `
         <h2>パスワードリセットのご案内</h2>
@@ -243,32 +323,94 @@ router.post(
       `;
 
       try {
-        await sendEmail({
-          email: user.email,
-          subject: 'パスワードリセット - 株式会社 Nigrek',
-          message,
-        });
+        // Check if email configuration is available
+        if (!process.env.EMAIL_HOST || !process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+          console.error('Email configuration missing. Please set EMAIL_HOST, EMAIL_USER, and EMAIL_PASS in .env file.');
+          // Still return success to user for security, but log the error
+          console.log('Password reset token generated (email not sent):', resetToken);
+          return res.json({
+            success: true,
+            message: 'パスワードリセット用のメールを送信しました。',
+            // In development, include the reset token for testing
+            ...(process.env.NODE_ENV !== 'production' && { 
+              resetToken: resetToken,
+              resetUrl: resetUrl 
+            }),
+          });
+        }
 
-        res.json({
-          success: true,
-          message: 'パスワードリセット用のメールを送信しました。',
-        });
+        try {
+          await sendEmail({
+            email: user.email,
+            subject: 'パスワードリセット - 株式会社 Nigrek',
+            message,
+          });
+
+          res.json({
+            success: true,
+            message: 'パスワードリセット用のメールを送信しました。',
+          });
+        } catch (emailError) {
+          console.error('Email send error:', emailError);
+          
+          // In development, don't delete the token - return it for testing
+          if (process.env.NODE_ENV !== 'production') {
+            console.log('Development mode: Returning reset token despite email failure');
+            return res.json({
+              success: true,
+              message: 'パスワードリセット用のメールを送信しました。',
+              resetToken: resetToken,
+              resetUrl: resetUrl,
+              error: 'メール送信に失敗しましたが、開発環境のためトークンを返します。',
+            });
+          }
+
+          // In production, delete the token only if email fails
+          // This prevents token reuse if email service is down
+          user.resetPasswordToken = undefined;
+          user.resetPasswordExpire = undefined;
+          await user.save({ validateBeforeSave: false });
+
+          return res.status(500).json({
+            success: false,
+            message: 'メール送信に失敗しました。後でもう一度お試しください。',
+          });
+        }
       } catch (error) {
-        console.error('Email send error:', error);
-        user.resetPasswordToken = undefined;
-        user.resetPasswordExpire = undefined;
-        await user.save({ validateBeforeSave: false });
+        console.error('Unexpected error in forgot password:', error);
+        
+        // In development, still return the token if we have it
+        if (process.env.NODE_ENV !== 'production' && resetToken) {
+          return res.json({
+            success: true,
+            message: 'パスワードリセット用のメールを送信しました。',
+            resetToken: resetToken,
+            resetUrl: resetUrl,
+            error: '予期しないエラーが発生しましたが、開発環境のためトークンを返します。',
+          });
+        }
 
         return res.status(500).json({
           success: false,
-          message: 'メール送信に失敗しました。後でもう一度お試しください。',
+          message: 'サーバーエラーが発生しました。後でもう一度お試しください。',
         });
       }
     } catch (error) {
       console.error('Forgot password error:', error);
+      console.error('Error stack:', error.stack);
+      
+      // Return detailed error in development
+      const errorMessage = process.env.NODE_ENV !== 'production'
+        ? error.message || 'サーバーエラーが発生しました。'
+        : 'サーバーエラーが発生しました。';
+      
       res.status(500).json({
         success: false,
-        message: 'サーバーエラーが発生しました。',
+        message: errorMessage,
+        ...(process.env.NODE_ENV !== 'production' && { 
+          error: error.message,
+          stack: error.stack 
+        }),
       });
     }
   }
@@ -294,11 +436,33 @@ router.put(
         });
       }
 
-      // Get hashed token
+      // Check if token parameter exists
+      if (!req.params.resettoken) {
+        return res.status(400).json({
+          success: false,
+          message: 'リセットトークンが提供されていません。',
+        });
+      }
+
+      // Get hashed token - decode URL encoding if present
+      let rawToken;
+      try {
+        rawToken = decodeURIComponent(req.params.resettoken);
+      } catch (e) {
+        // If decoding fails, use the token as-is
+        rawToken = req.params.resettoken;
+      }
       const resetPasswordToken = crypto
         .createHash('sha256')
-        .update(req.params.resettoken)
+        .update(rawToken)
         .digest('hex');
+
+      // Debug logging in development
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('Reset password attempt:');
+        console.log('Raw token:', rawToken);
+        console.log('Hashed token:', resetPasswordToken);
+      }
 
       const user = await User.findOne({
         resetPasswordToken,
@@ -306,6 +470,14 @@ router.put(
       });
 
       if (!user) {
+        // Additional check: see if token exists but expired
+        const expiredUser = await User.findOne({ resetPasswordToken });
+        if (expiredUser) {
+          console.log('Token found but expired. Expire time:', expiredUser.resetPasswordExpire, 'Current time:', Date.now());
+        } else {
+          console.log('Token not found in database');
+        }
+
         return res.status(400).json({
           success: false,
           message: '無効または期限切れのトークンです。',
