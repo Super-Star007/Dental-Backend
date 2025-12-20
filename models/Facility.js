@@ -25,6 +25,9 @@ const facilitySchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    units: {
+      type: Number,
+    },
     contact_person: {
       name: String,
       phone: String,

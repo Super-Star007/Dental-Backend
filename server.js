@@ -48,6 +48,7 @@ app.use('/api/audit-logs', require('./routes/auditLogs'));
 app.use('/api/visits', require('./routes/visits'));
 app.use('/api/patients', require('./routes/patients'));
 app.use('/api/facilities', require('./routes/facilities'));
+app.use('/api/masters', require('./routes/masters'));
 
 // Health check
 app.get('/api/health', (req, res) => {
